@@ -899,3 +899,73 @@ fn test_chown_reference_file() {
         .stderr_contains("ownership of 'b' retained as")
         .no_stdout();
 }
+
+#[test]
+#[cfg(not(target_vendor = "apple"))]
+fn test_traverse_symlinks() {
+    use std::os::unix::prelude::MetadataExt;
+    let groups = nix::unistd::getgroups().unwrap();
+    if groups.len() < 2 {
+        return;
+    }
+    let (first_group, second_group) = (groups[0], groups[1]);
+
+    for (args, traverse_first, traverse_second) in [
+        (&[][..] as &[&str], false, false),
+        (&["-H"][..], true, false),
+        (&["-P"][..], false, false),
+        (&["-L"][..], true, true),
+    ] {
+        let scene = TestScenario::new(util_name!());
+        let (at, mut ucmd) = (scene.fixtures.clone(), scene.ucmd());
+
+        at.mkdir("dir");
+        at.mkdir("dir2");
+        at.touch("dir2/file");
+        at.mkdir("dir3");
+        at.touch("dir3/file");
+        at.symlink_dir("dir2", "dir/dir2_ln");
+        at.symlink_dir("dir3", "dir3_ln");
+
+        scene
+            .ccmd("chown")
+            .arg(format!(":{}", first_group.as_raw()))
+            .arg("dir2/file")
+            .arg("dir3/file")
+            .succeeds();
+
+        assert_eq!(
+            at.plus("dir2/file").metadata().unwrap().gid(),
+            first_group.as_raw()
+        );
+        assert_eq!(
+            at.plus("dir3/file").metadata().unwrap().gid(),
+            first_group.as_raw()
+        );
+
+        ucmd.arg("-R")
+            .args(args)
+            .arg(format!(":{}", second_group.as_raw()))
+            .arg("dir")
+            .arg("dir3_ln")
+            .succeeds()
+            .no_stderr();
+
+        assert_eq!(
+            at.plus("dir2/file").metadata().unwrap().gid(),
+            if traverse_second {
+                second_group.as_raw()
+            } else {
+                first_group.as_raw()
+            }
+        );
+        assert_eq!(
+            at.plus("dir3/file").metadata().unwrap().gid(),
+            if traverse_first {
+                second_group.as_raw()
+            } else {
+                first_group.as_raw()
+            }
+        );
+    }
+}
