@@ -1279,6 +1279,50 @@ fn test_chmod_recursive_symlink_combinations() {
 }
 
 #[test]
+fn test_symlink_cycle_detection() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+
+    at.mkdir_all("a/b/c");
+    at.symlink_dir(&at.plus_as_string("a"), "a/b/c/d");
+
+    scene
+        .ucmd()
+        .arg("-RL")
+        .arg("755")
+        .arg("a")
+        .fails()
+        .stderr_contains("too many levels of symbolic links");
+}
+
+#[test]
+fn test_symlink_cycle_with_sibling() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+
+    at.mkdir_all("a/x");
+    at.mkdir_all("a/y");
+    at.touch("a/x/file");
+    at.touch("a/y/file");
+    // a/y contains a cycle back to a/
+    at.symlink_dir(&at.plus_as_string("a"), "a/y/cycle");
+
+    scene
+        .ucmd()
+        .arg("-RL")
+        .arg("755")
+        .arg("a")
+        .fails()
+        .stderr_contains("too many levels of symbolic links");
+
+    // sibling a/x/file should still have been changed
+    assert_eq!(at.metadata("a/x/file").permissions().mode() & 0o777, 0o755);
+
+    // a/y/file should also have been changed before cycle was hit
+    assert_eq!(at.metadata("a/y/file").permissions().mode() & 0o777, 0o755);
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn test_chmod_non_utf8_paths() {
     use std::ffi::OsStr;

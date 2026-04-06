@@ -6,6 +6,7 @@
 // spell-checker:ignore (ToDO) Chmoder cmode fmode fperm fref ugoa RFILE RFILE's
 
 use clap::{Arg, ArgAction, Command};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -403,7 +404,8 @@ impl Chmoder {
                 return Err(ChmodError::PreserveRoot("/".into()).into());
             }
             if self.recursive {
-                r = self.walk_dir_with_context(file, true).and(r);
+                let mut visited = HashSet::new();
+                r = self.walk_dir_with_context(file, true, &mut visited).and(r);
             } else {
                 r = self.chmod_file(file).and(r);
             }
@@ -417,7 +419,12 @@ impl Chmoder {
 
     // Non-safe traversal implementation for platforms without safe_traversal support
     #[cfg(any(not(unix), target_os = "redox"))]
-    fn walk_dir_with_context(&self, file_path: &Path, is_command_line_arg: bool) -> UResult<()> {
+    fn walk_dir_with_context(
+        &self,
+        file_path: &Path,
+        is_command_line_arg: bool,
+        visited: &mut HashSet<(u64, u64)>,
+    ) -> UResult<()> {
         let mut r = self.chmod_file(file_path);
 
         // Determine whether to traverse symlinks based on context and traversal mode
@@ -446,13 +453,33 @@ impl Chmoder {
                 {
                     if path.is_symlink() {
                         r = self.handle_symlink_during_recursion(&path).and(r);
-                    } else {
-                        r = self.walk_dir_with_context(path.as_path(), false).and(r);
+                        continue;
                     }
                 }
-                #[cfg(target_os = "redox")]
-                {
-                    r = self.walk_dir_with_context(path.as_path(), false).and(r);
+
+                // shared cycle detection for both redox & non-unix
+                if path.is_dir() {
+                    if let Ok(meta) = fs::metadata(&path) {
+                        let inode_keyval = (meta.dev(), meta.ino());
+                        if !visited.insert(inode_keyval) {
+                            if !self.quiet {
+                                show_error!(
+                                    "cannot access {}: too many levels of symbolic links",
+                                    path.quote()
+                                );
+                            }
+                            r = r.and(Err(ExitCode::new(1).into()));
+                            continue;
+                        }
+                        r = self
+                            .walk_dir_with_context(path.as_path(), false, &mut visited)
+                            .and(r);
+                        visited.remove(&inode_keyval);
+                    }
+                } else {
+                    r = self
+                        .walk_dir_with_context(path.as_path(), false, &mut visited)
+                        .and(r);
                 }
             }
         }
@@ -460,7 +487,12 @@ impl Chmoder {
     }
 
     #[cfg(all(unix, not(target_os = "redox")))]
-    fn walk_dir_with_context(&self, file_path: &Path, is_command_line_arg: bool) -> UResult<()> {
+    fn walk_dir_with_context(
+        &self,
+        file_path: &Path,
+        is_command_line_arg: bool,
+        visited: &mut HashSet<(u64, u64)>,
+    ) -> UResult<()> {
         let mut r = self.chmod_file(file_path);
 
         // Determine whether to traverse symlinks based on context and traversal mode
@@ -474,7 +506,7 @@ impl Chmoder {
         if (!file_path.is_symlink() || should_follow_symlink) && file_path.is_dir() {
             match DirFd::open(file_path, SymlinkBehavior::Follow) {
                 Ok(dir_fd) => {
-                    r = self.safe_traverse_dir(&dir_fd, file_path).and(r);
+                    r = self.safe_traverse_dir(&dir_fd, file_path, visited).and(r);
                 }
                 Err(err) => {
                     // Handle permission denied errors with proper file path context
@@ -490,7 +522,12 @@ impl Chmoder {
     }
 
     #[cfg(all(unix, not(target_os = "redox")))]
-    fn safe_traverse_dir(&self, dir_fd: &DirFd, dir_path: &Path) -> UResult<()> {
+    fn safe_traverse_dir(
+        &self,
+        dir_fd: &DirFd,
+        dir_path: &Path,
+        visited: &mut HashSet<(u64, u64)>,
+    ) -> UResult<()> {
         let mut r = Ok(());
 
         let entries = dir_fd.read_dir()?;
@@ -516,7 +553,7 @@ impl Chmoder {
 
             if entry_path.is_symlink() {
                 r = self
-                    .handle_symlink_during_safe_recursion(&entry_path, dir_fd, &entry_name)
+                    .handle_symlink_during_safe_recursion(&entry_path, dir_fd, &entry_name, visited)
                     .and(r);
             } else {
                 // For regular files and directories, chmod them
@@ -526,9 +563,24 @@ impl Chmoder {
 
                 // Recurse into subdirectories using the existing directory fd
                 if meta.is_dir() {
+                    let inode_keyval = (meta.dev(), meta.ino());
+
+                    if !visited.insert(inode_keyval) {
+                        if !self.quiet {
+                            show_error!(
+                                "cannot access {}: too many levels of symbolic links",
+                                entry_path.quote()
+                            );
+                        }
+                        r = r.and(Err(ExitCode::new(1)));
+                        continue;
+                    }
+
                     match dir_fd.open_subdir(&entry_name, SymlinkBehavior::Follow) {
                         Ok(child_dir_fd) => {
-                            r = self.safe_traverse_dir(&child_dir_fd, &entry_path).and(r);
+                            r = self
+                                .safe_traverse_dir(&child_dir_fd, &entry_path, visited)
+                                .and(r);
                         }
                         Err(err) => {
                             let error = if err.kind() == std::io::ErrorKind::PermissionDenied {
@@ -539,6 +591,8 @@ impl Chmoder {
                             r = r.and(Err(error));
                         }
                     }
+
+                    visited.remove(&inode_keyval);
                 }
             }
         }
@@ -551,6 +605,7 @@ impl Chmoder {
         path: &Path,
         dir_fd: &DirFd,
         entry_name: &std::ffi::OsStr,
+        visited: &mut HashSet<(u64, u64)>,
     ) -> UResult<()> {
         // During recursion, determine behavior based on traversal mode
         match self.traverse_symlinks {
@@ -558,7 +613,23 @@ impl Chmoder {
                 // Follow all symlinks during recursion
                 // Check if the symlink target is a directory, but handle dangling symlinks gracefully
                 match fs::metadata(path) {
-                    Ok(meta) if meta.is_dir() => self.walk_dir_with_context(path, false),
+                    Ok(meta) if meta.is_dir() => {
+                        // check cycle before following symlink to dir
+                        let inode_keyval = (meta.dev(), meta.ino());
+                        if !visited.insert(inode_keyval) {
+                            if !self.quiet {
+                                show_error!(
+                                    "cannot access {}: too many levels of symbolic links",
+                                    path.quote()
+                                );
+                            }
+                            return Err(ExitCode::new(1));
+                        }
+                        let r = self.walk_dir_with_context(path, false, visited);
+                        // it's removed after recursion so that sibling dirs aren't skipped
+                        visited.remove(&inode_keyval);
+                        r
+                    }
                     Ok(meta) => {
                         // It's a file symlink, chmod it using safe traversal
                         self.safe_chmod_file(path, dir_fd, entry_name, meta.mode() & 0o7777)
