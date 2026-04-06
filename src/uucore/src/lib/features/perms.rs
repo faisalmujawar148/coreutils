@@ -449,13 +449,22 @@ impl ChownExecutor {
             return 1;
         };
 
+        // Visited set -> for checking if nodes have been visited uring traversal
+        let mut visited = std::collections::HashSet::new();
+
         let mut ret = 0;
-        self.safe_traverse_dir(&dir_fd, root, &mut ret);
+        self.safe_traverse_dir(&dir_fd, root, &mut ret, &mut visited);
         ret
     }
 
     #[cfg(target_os = "linux")]
-    fn safe_traverse_dir(&self, dir_fd: &DirFd, dir_path: &Path, ret: &mut i32) {
+    fn safe_traverse_dir(
+        &self,
+        dir_fd: &DirFd,
+        dir_path: &Path,
+        ret: &mut i32,
+        visited: &mut std::collections::HashSet<(u64, u64)>,
+    ) {
         // Read directory entries
         let entries = match dir_fd.read_dir() {
             Ok(entries) => entries,
@@ -537,9 +546,22 @@ impl ChownExecutor {
 
             // Recurse into subdirectories
             if meta.is_dir() && (follow || !meta.file_type().is_symlink()) {
+                // Uniquely identify the directory
+                let inode_keyval = (meta.dev(), meta.ino());
+                if !visited.insert(inode_keyval) {
+                    *ret = 1;
+                    if self.verbosity.level != VerbosityLevel::Silent {
+                        show_error!(
+                            "cannot access {}: too many levels of symbolic links",
+                            entry_path.quote()
+                        );
+                    }
+                    // Skip this entry, don't recurse here as already visited
+                    continue;
+                }
                 match dir_fd.open_subdir(&entry_name, SymlinkBehavior::Follow) {
                     Ok(subdir_fd) => {
-                        self.safe_traverse_dir(&subdir_fd, &entry_path, ret);
+                        self.safe_traverse_dir(&subdir_fd, &entry_path, ret, visited);
                     }
                     Err(e) => {
                         *ret = 1;
@@ -552,6 +574,8 @@ impl ChownExecutor {
                         }
                     }
                 }
+                // Remove after recursing, so sibling nodes aren't falsely skipped
+                visited.remove(&inode_keyval);
             }
         }
     }

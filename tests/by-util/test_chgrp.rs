@@ -428,6 +428,128 @@ fn test_traverse_symlinks() {
 
 #[test]
 #[cfg(not(target_vendor = "apple"))]
+fn test_symlink_cycle_detection() {
+    let groups = nix::unistd::getgroups().unwrap();
+    if groups.is_empty() {
+        return;
+    }
+    let group = groups[0];
+
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+
+    at.mkdir_all("a/b/c");
+    // symlink points back to ancestor 'a', creating a cycle
+    at.symlink_dir(&at.plus_as_string("a"), "a/b/c/d");
+
+    scene
+        .ucmd()
+        .arg("-RL")
+        .arg(group.as_raw().to_string())
+        .arg("a")
+        .fails()
+        .stderr_contains("too many levels of symbolic links");
+}
+
+#[test]
+#[cfg(not(target_vendor = "apple"))]
+fn test_symlink_cycle_with_sibling() {
+    use std::os::unix::prelude::MetadataExt;
+    let groups = nix::unistd::getgroups().unwrap();
+    if groups.len() < 2 {
+        return;
+    }
+    let (first_group, second_group) = (groups[0], groups[1]);
+
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+
+    // Create two sibling directories, with 1 having a cycle
+    at.mkdir_all("a/x");
+    at.mkdir_all("a/y");
+    at.touch("a/x/file");
+    at.touch("a/y/file");
+    at.symlink_dir(&at.plus_as_string("a"), "a/y/cycle");
+
+    // Set both files to first_group
+    scene
+        .ccmd("chgrp")
+        .arg(first_group.as_raw().to_string())
+        .arg("a/x/file")
+        .arg("a/y/file")
+        .succeeds();
+
+    // should fail due to cycle but still process the sibling
+    scene
+        .ucmd()
+        .arg("-RL")
+        .arg(second_group.as_raw().to_string())
+        .arg("a")
+        .fails()
+        .stderr_contains("too many levels of symbolic links");
+
+    // a/x/file should still have been changed despite the cycle in a/y
+    assert_eq!(
+        at.plus("a/x/file").metadata().unwrap().gid(),
+        second_group.as_raw()
+    );
+
+    // a/y/file should also have been changed before the cycle was hit
+    assert_eq!(
+        at.plus("a/y/file").metadata().unwrap().gid(),
+        second_group.as_raw()
+    );
+}
+
+#[test]
+#[cfg(not(target_vendor = "apple"))]
+fn test_symlink_no_cycle_with_siblings() {
+    use std::os::unix::prelude::MetadataExt;
+    let groups = nix::unistd::getgroups().unwrap();
+    if groups.len() < 2 {
+        return;
+    }
+    let (first_group, second_group) = (groups[0], groups[1]);
+
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+
+    // Create two sibling directories, each with a file
+    at.mkdir_all("a/x");
+    at.mkdir_all("a/y");
+    at.touch("a/x/file");
+    at.touch("a/y/file");
+
+    // Set both files to first_group
+    scene
+        .ccmd("chgrp")
+        .arg(first_group.as_raw().to_string())
+        .arg("a/x/file")
+        .arg("a/y/file")
+        .succeeds();
+
+    // shouldn't fail, and process both siblings
+    scene
+        .ucmd()
+        .arg("-RL")
+        .arg(second_group.as_raw().to_string())
+        .arg("a")
+        .succeeds()
+        .no_stderr();
+
+    // Both files should have been changed, neither is a cycle
+    assert_eq!(
+        at.plus("a/x/file").metadata().unwrap().gid(),
+        second_group.as_raw()
+    );
+    assert_eq!(
+        at.plus("a/y/file").metadata().unwrap().gid(),
+        second_group.as_raw()
+    );
+}
+
+#[test]
+#[cfg(not(target_vendor = "apple"))]
 fn test_from_option() {
     use std::os::unix::fs::MetadataExt;
     let scene = TestScenario::new(util_name!());
